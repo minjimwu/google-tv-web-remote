@@ -1,0 +1,7 @@
+flask>=2.3.0
+flask-cors>=4.0.0
+androidtvremote2>=0.0.14
+cryptography>=41.0.0
+protobuf>=4.23.0
+aiohttp>=3.8.0
+requests>=2.31.0
