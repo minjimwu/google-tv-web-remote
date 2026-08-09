@@ -195,6 +195,7 @@ class HeranGoogleTVController:
                 async def _do_finish():
                     await self.client.async_finish_pairing(pin)
                     await self.client.async_connect()
+                    self.client.keep_reconnecting()
                     return True
 
                 worker.run_coroutine(_do_finish(), timeout=10)
@@ -233,6 +234,7 @@ class HeranGoogleTVController:
 
                 async def _do_connect():
                     await self.client.async_connect()
+                    self.client.keep_reconnecting()
                     return True
 
                 worker.run_coroutine(_do_connect(), timeout=8)
@@ -272,27 +274,67 @@ class HeranGoogleTVController:
             "APP_HERAN": "android.intent.action.VIEW"
         }
 
-        if HAS_NATIVE_LIB and self.client and self.is_connected:
-            try:
-                if key_name in APP_MAP:
-                    app_link = APP_MAP[key_name]
-                    self.client.send_launch_app_command(app_link)
-                    return {"status": "success", "key": key_name, "type": "app_launch"}
-                else:
-                    remote_key = KEY_MAP.get(key_name, key_name)
-                    self.client.send_key_command(remote_key, "SHORT")
-                    return {"status": "success", "key": key_name, "command": remote_key}
-            except Exception as e:
-                logger.error(f"發送按鍵失敗: {e}")
-                return {"status": "error", "message": str(e)}
-        else:
-            if not self.is_connected:
-                self.connect(self.tv_ip)
-            return {"status": "success", "key": key_name, "mode": "sent", "tv_ip": self.tv_ip}
+        if HAS_NATIVE_LIB:
+            if not self.client and self.tv_ip:
+                self.client = AndroidTVRemote(
+                    client_name="HERAN-Web-Remote",
+                    certfile=self.cert_path,
+                    keyfile=self.key_path,
+                    host=self.tv_ip,
+                    loop=worker.loop
+                )
+
+            if self.client:
+                async def _send_with_retry():
+                    # 若尚未連線或連線已中斷，自動連線
+                    if not getattr(self.client, "_remote_message_protocol", None):
+                        logger.info("⚡ 正在重新建立與電視的 TLS 連線...")
+                        await self.client.async_connect()
+                        self.client.keep_reconnecting()
+
+                    if key_name in APP_MAP:
+                        app_link = APP_MAP[key_name]
+                        self.client.send_launch_app_command(app_link)
+                        return {"status": "success", "key": key_name, "type": "app_launch"}
+                    else:
+                        remote_key = KEY_MAP.get(key_name, key_name)
+                        self.client.send_key_command(remote_key, "SHORT")
+                        return {"status": "success", "key": key_name, "command": remote_key}
+
+                try:
+                    res = worker.run_coroutine(_send_with_retry(), timeout=5)
+                    self.is_connected = True
+                    return res
+                except Exception as e:
+                    logger.warning(f"首次發送失敗 ({e})，正在嘗試強制重連並重試...")
+                    async def _force_reconnect_and_send():
+                        await self.client.async_connect()
+                        self.client.keep_reconnecting()
+                        if key_name in APP_MAP:
+                            self.client.send_launch_app_command(APP_MAP[key_name])
+                            return {"status": "success", "key": key_name, "type": "app_launch"}
+                        else:
+                            remote_key = KEY_MAP.get(key_name, key_name)
+                            self.client.send_key_command(remote_key, "SHORT")
+                            return {"status": "success", "key": key_name, "command": remote_key}
+
+                    try:
+                        res = worker.run_coroutine(_force_reconnect_and_send(), timeout=6)
+                        self.is_connected = True
+                        return res
+                    except Exception as err:
+                        logger.error(f"重試發送按鍵仍失敗: {err}")
+                        self.is_connected = False
+                        return {"status": "error", "message": str(err)}
+
+        return {"status": "error", "message": "尚未連線至電視"}
 
     def get_status(self) -> Dict[str, Any]:
+        is_conn = False
+        if HAS_NATIVE_LIB and self.client:
+            is_conn = bool(getattr(self.client, "_remote_message_protocol", None)) or self.is_connected
         return {
-            "is_connected": self.is_connected,
+            "is_connected": is_conn,
             "is_pairing": self.is_pairing,
             "tv_ip": self.tv_ip,
             "has_native_lib": HAS_NATIVE_LIB
