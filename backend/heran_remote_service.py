@@ -89,19 +89,39 @@ class HeranGoogleTVController:
             logger.error(f"儲存設定檔失敗: {e}")
 
     def _get_local_subnets(self) -> List[str]:
-        """自動偵測本機所有網卡 (wlan0: YOUR_SUBNET, wlan1: YOUR_HOTSPOT_SUBNET 等) 之子網段"""
+        """自動偵測本機所有網卡 (wlan0, wlan1 等) 之子網段，包含備援掃描"""
         subnets = set()
-                
+        
+        # 1. 透過 Linux ip 指令讀取所有 IPv4 網卡
         try:
-            # 透過 socket 與主機名稱查詢各網卡 IP
-            hostname = socket.gethostname()
-            for ip in socket.gethostbyname_ex(hostname)[2]:
-                if not ip.startswith("127."):
-                    subnets.add(".".join(ip.split(".")[:3]))
+            import subprocess
+            res = subprocess.run(["ip", "-o", "-4", "addr", "show"], capture_output=True, text=True, timeout=2)
+            for line in res.stdout.splitlines():
+                parts = line.strip().split()
+                if len(parts) >= 4:
+                    ip_cidr = parts[3]
+                    ip = ip_cidr.split("/")[0]
+                    if not ip.startswith("127."):
+                        subnets.add(".".join(ip.split(".")[:3]))
         except Exception:
             pass
 
-        return sorted(list(subnets))
+        # 2. 透過 UDP socket 探索預設閘道網段
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            if not ip.startswith("127."):
+                subnets.add(".".join(ip.split(".")[:3]))
+            s.close()
+        except Exception:
+            pass
+
+        # 3. 透過已記錄的 tv_ip 推導網段
+        if self.tv_ip and "." in self.tv_ip:
+            subnets.add(".".join(self.tv_ip.split(".")[:3]))
+
+        return sorted(list(subnets)) if subnets else ["192.168.1", "192.168.0"]
 
     def discover_devices(self) -> List[Dict[str, Any]]:
         """全自動跨網段搜尋區域網路 (LAN) 中的 Google TV / 禾聯電視設備"""
@@ -115,7 +135,7 @@ class HeranGoogleTVController:
             for p in target_ports:
                 try:
                     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(0.35)
+                    sock.settimeout(0.25)
                     if sock.connect_ex((ip_str, p)) == 0:
                         matched_port = p
                         sock.close()
@@ -157,6 +177,41 @@ class HeranGoogleTVController:
                     logger.info(f"✅ 發現電視: {res['name']} (IP: {res['ip']})")
 
         return found_devices
+
+    def _auto_find_paired_tv(self) -> Optional[str]:
+        """當原 IP 無法連線時，自動掃描區網尋找已配對的 Google TV (DHCP IP 漂移自癒)"""
+        logger.info("🔄 原電視 IP 未響應，啟動智慧區網掃描與 DHCP 漂移自癒程序...")
+        devices = self.discover_devices()
+        tv_devices = [d for d in devices if d.get("port") in [6466, 6467]]
+
+        for dev in tv_devices:
+            candidate_ip = dev["ip"]
+            logger.info(f"🧪 嘗試測試已配對憑證至新發現電視: {candidate_ip}...")
+            try:
+                test_client = AndroidTVRemote(
+                    client_name="HERAN-Web-Remote",
+                    certfile=self.cert_path,
+                    keyfile=self.key_path,
+                    host=candidate_ip,
+                    loop=worker.loop
+                )
+                async def _try_connect():
+                    await test_client.async_connect()
+                    test_client.keep_reconnecting()
+                    return True
+
+                worker.run_coroutine(_try_connect(), timeout=4)
+                # 連線成功！更新為新的電視 IP
+                self.client = test_client
+                self.tv_ip = candidate_ip
+                self.is_connected = True
+                self._save_config()
+                logger.info(f"🎉 成功自癒重連！電視已無縫漫遊至新 IP: {self.tv_ip}")
+                return candidate_ip
+            except Exception as e:
+                logger.debug(f"候選 IP {candidate_ip} 驗證非原電視: {e}")
+
+        return None
 
     def start_pairing(self, tv_ip: str) -> Dict[str, Any]:
         self.tv_ip = tv_ip.strip()
@@ -216,6 +271,10 @@ class HeranGoogleTVController:
     def connect(self, tv_ip: Optional[str] = None) -> Dict[str, Any]:
         target_ip = (tv_ip or self.tv_ip).strip()
         if not target_ip:
+            # 嘗試自動搜尋電視
+            found_ip = self._auto_find_paired_tv()
+            if found_ip:
+                return {"status": "success", "message": f"已自動連線至電視 ({self.tv_ip})"}
             return {"status": "error", "message": "請先選擇電視 IP"}
 
         self.tv_ip = target_ip
@@ -223,7 +282,7 @@ class HeranGoogleTVController:
 
         if HAS_NATIVE_LIB:
             try:
-                if not self.client:
+                if not self.client or self.client._host != self.tv_ip:
                     self.client = AndroidTVRemote(
                         client_name="HERAN-Web-Remote",
                         certfile=self.cert_path,
@@ -237,12 +296,17 @@ class HeranGoogleTVController:
                     self.client.keep_reconnecting()
                     return True
 
-                worker.run_coroutine(_do_connect(), timeout=8)
+                worker.run_coroutine(_do_connect(), timeout=5)
                 self.is_connected = True
                 self._save_config()
                 return {"status": "success", "message": f"已連線至電視 ({self.tv_ip})"}
             except Exception as e:
-                logger.warning(f"連線失敗 ({e})，正在重新嘗試配對...")
+                logger.warning(f"連線 {self.tv_ip} 失敗 ({e})，嘗試自動掃描與 IP 漫遊自癒...")
+                new_ip = self._auto_find_paired_tv()
+                if new_ip:
+                    return {"status": "success", "message": f"已自動漫遊並連線至電視 ({self.tv_ip})"}
+                
+                # 仍找不到則發起新配對
                 self.start_pairing(self.tv_ip)
                 return {
                     "status": "needs_pairing",
@@ -302,30 +366,26 @@ class HeranGoogleTVController:
                         return {"status": "success", "key": key_name, "command": remote_key}
 
                 try:
-                    res = worker.run_coroutine(_send_with_retry(), timeout=5)
+                    res = worker.run_coroutine(_send_with_retry(), timeout=4)
                     self.is_connected = True
                     return res
                 except Exception as e:
-                    logger.warning(f"首次發送失敗 ({e})，正在嘗試強制重連並重試...")
-                    async def _force_reconnect_and_send():
-                        await self.client.async_connect()
-                        self.client.keep_reconnecting()
-                        if key_name in APP_MAP:
-                            self.client.send_launch_app_command(APP_MAP[key_name])
-                            return {"status": "success", "key": key_name, "type": "app_launch"}
-                        else:
-                            remote_key = KEY_MAP.get(key_name, key_name)
-                            self.client.send_key_command(remote_key, "SHORT")
-                            return {"status": "success", "key": key_name, "command": remote_key}
-
-                    try:
-                        res = worker.run_coroutine(_force_reconnect_and_send(), timeout=6)
-                        self.is_connected = True
-                        return res
-                    except Exception as err:
-                        logger.error(f"重試發送按鍵仍失敗: {err}")
-                        self.is_connected = False
-                        return {"status": "error", "message": str(err)}
+                    logger.warning(f"發送失敗 ({e})，嘗試 IP 漂移自癒與重試...")
+                    new_ip = self._auto_find_paired_tv()
+                    if new_ip and self.client:
+                        try:
+                            if key_name in APP_MAP:
+                                self.client.send_launch_app_command(APP_MAP[key_name])
+                                return {"status": "success", "key": key_name, "type": "app_launch", "tv_ip": self.tv_ip}
+                            else:
+                                remote_key = KEY_MAP.get(key_name, key_name)
+                                self.client.send_key_command(remote_key, "SHORT")
+                                return {"status": "success", "key": key_name, "command": remote_key, "tv_ip": self.tv_ip}
+                        except Exception as err2:
+                            logger.error(f"自癒後發送仍失敗: {err2}")
+                    
+                    self.is_connected = False
+                    return {"status": "error", "message": str(e)}
 
         return {"status": "error", "message": "尚未連線至電視"}
 
