@@ -179,13 +179,35 @@ class HeranGoogleTVController:
         return found_devices
 
     def _auto_find_paired_tv(self) -> Optional[str]:
-        """當原 IP 無法連線時，自動掃描區網尋找已配對的 Google TV (DHCP IP 漂移自癒)"""
-        logger.info("🔄 原電視 IP 未響應，啟動智慧區網掃描與 DHCP 漂移自癒程序...")
-        devices = self.discover_devices()
-        tv_devices = [d for d in devices if d.get("port") in [6466, 6467]]
+        """當原 IP 無法連線時，自動毫秒級探測區網尋找已配對的 Google TV (DHCP IP 漫遊自癒)"""
+        logger.info("🔄 原電視 IP 未響應，啟動毫秒級區網探測與 DHCP 漫遊自癒程序...")
+        subnets = self._get_local_subnets()
+        candidate_ips = []
 
-        for dev in tv_devices:
-            candidate_ip = dev["ip"]
+        def probe_6466(ip_str: str) -> Optional[str]:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.2)
+                if sock.connect_ex((ip_str, 6466)) == 0:
+                    sock.close()
+                    return ip_str
+                sock.close()
+            except Exception:
+                pass
+            return None
+
+        all_ips = []
+        for sn in subnets:
+            all_ips.extend([f"{sn}.{i}" for i in range(1, 255)])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
+            for ip_found in executor.map(probe_6466, all_ips):
+                if ip_found:
+                    candidate_ips.append(ip_found)
+
+        logger.info(f"🔎 探測到開放 6466 遙控埠之電視候選名單: {candidate_ips}")
+
+        for candidate_ip in candidate_ips:
             logger.info(f"🧪 嘗試測試已配對憑證至新發現電視: {candidate_ip}...")
             try:
                 test_client = AndroidTVRemote(
@@ -200,7 +222,7 @@ class HeranGoogleTVController:
                     test_client.keep_reconnecting()
                     return True
 
-                worker.run_coroutine(_try_connect(), timeout=4)
+                worker.run_coroutine(_try_connect(), timeout=3)
                 # 連線成功！更新為新的電視 IP
                 self.client = test_client
                 self.tv_ip = candidate_ip
@@ -209,7 +231,7 @@ class HeranGoogleTVController:
                 logger.info(f"🎉 成功自癒重連！電視已無縫漫遊至新 IP: {self.tv_ip}")
                 return candidate_ip
             except Exception as e:
-                logger.debug(f"候選 IP {candidate_ip} 驗證非原電視: {e}")
+                logger.warning(f"候選 IP {candidate_ip} 驗證失敗: {e}")
 
         return None
 
@@ -350,20 +372,35 @@ class HeranGoogleTVController:
 
             if self.client:
                 async def _send_with_retry():
-                    # 若尚未連線或連線已中斷，自動連線
-                    if not getattr(self.client, "_remote_message_protocol", None):
-                        logger.info("⚡ 正在重新建立與電視的 TLS 連線...")
-                        await self.client.async_connect()
-                        self.client.keep_reconnecting()
+                    # 預檢：快速測試當前 tv_ip 的 6466 通訊埠是否響應
+                    sock_ok = False
+                    try:
+                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        s.settimeout(0.2)
+                        if s.connect_ex((self.tv_ip, 6466)) == 0:
+                            sock_ok = True
+                        s.close()
+                    except Exception:
+                        pass
+
+                    if not sock_ok or not getattr(self.client, "_remote_message_protocol", None):
+                        logger.info(f"⚡ 檢查到 {self.tv_ip}:6466 離線或 Socket 中斷，啟動即時漫遊自癒...")
+                        if not sock_ok:
+                            new_ip = self._auto_find_paired_tv()
+                            if not new_ip:
+                                raise Exception(f"無法連線至電視 IP ({self.tv_ip}) 且漫遊搜尋未果")
+                        else:
+                            await self.client.async_connect()
+                            self.client.keep_reconnecting()
 
                     if key_name in APP_MAP:
                         app_link = APP_MAP[key_name]
                         self.client.send_launch_app_command(app_link)
-                        return {"status": "success", "key": key_name, "type": "app_launch"}
+                        return {"status": "success", "key": key_name, "type": "app_launch", "tv_ip": self.tv_ip}
                     else:
                         remote_key = KEY_MAP.get(key_name, key_name)
                         self.client.send_key_command(remote_key, "SHORT")
-                        return {"status": "success", "key": key_name, "command": remote_key}
+                        return {"status": "success", "key": key_name, "command": remote_key, "tv_ip": self.tv_ip}
 
                 try:
                     res = worker.run_coroutine(_send_with_retry(), timeout=4)
